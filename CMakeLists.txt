@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(SegmentRoutingFabric
-    VERSION 1.0.0
+    VERSION 1.0.1
     DESCRIPTION "Explicit governed segment-list construction, validation, lifecycle and authority runtime"
     HOMEPAGE_URL "https://github.com/summonlabs/Segment-Routing-Fabric"
     LANGUAGES CXX)

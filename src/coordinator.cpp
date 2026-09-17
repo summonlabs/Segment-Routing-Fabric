@@ -392,6 +392,8 @@ Response CoordinatorServer::dispatch(const Frame& frame, Session& session) {
                 for (const ExplanationEntry& entry : explanation.entries) {
                     response.reasons.push_back(Reason{entry.code, entry.index, entry.detail});
                 }
+                // A bounded presentation must never be reported as a complete one.
+                response.truncated = explanation.truncated;
                 response.status = StatusCode::Ok;
                 return response;
             }

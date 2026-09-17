@@ -1204,7 +1204,7 @@ SRF_TEST(adversarial, limits_every_bound_is_consulted) {
         SRF_EXPECT_PRIMARY(result, srf::ReasonCode::LimitMaxFrameBytes);
     }
     {
-        // Silent truncation: the retained history is exactly the bound.
+        // Bounded retention, and the view says so instead of claiming completeness.
         srf::Limits limits{};
         limits.max_history = 3;
         Harness harness(true, limits);
@@ -1219,10 +1219,14 @@ SRF_TEST(adversarial, limits_every_bound_is_consulted) {
             }
             generation = outcome.generation.value();
         }
+        const srf::HistoryReport report = harness.store().history_report();
+        SRF_EXPECT_EQ(report.retained, static_cast<std::uint32_t>(3));
+        SRF_EXPECT(report.at_capacity);
+        SRF_EXPECT(!report.complete());
         SRF_EXPECT_EQ(harness.store().history().size(), static_cast<std::size_t>(3));
     }
     {
-        // Silent truncation: the explanation is exactly the bound.
+        // A bounded presentation reports both what it kept and what it dropped.
         srf::Limits limits{};
         limits.max_explanation_entries = 2;
         Harness harness(true, limits);
@@ -1230,7 +1234,9 @@ SRF_TEST(adversarial, limits_every_bound_is_consulted) {
         const srf::Explanation explanation =
             harness.store().explain_currentness(srf::test::list_id(1));
         SRF_EXPECT(explanation.truncated);
-        SRF_EXPECT(explanation.size() <= static_cast<std::size_t>(2));
+        SRF_EXPECT(!explanation.complete());
+        SRF_EXPECT_EQ(explanation.retained_entries(), static_cast<std::uint32_t>(2));
+        SRF_EXPECT(explanation.total_entries > explanation.retained_entries());
     }
     {
         srf::Limits limits{};
@@ -1255,7 +1261,7 @@ SRF_TEST(adversarial, limits_every_bound_is_consulted) {
         SRF_EXPECT_REASON(result, srf::ReasonCode::LimitMaxReasons);
     }
     {
-        // Silent truncation: the diff is exactly the bound.
+        // A bounded comparison reports both what it kept and what it dropped.
         srf::Limits limits{};
         limits.max_diff_entries = 1;
         Harness harness(true, limits);
@@ -1266,7 +1272,9 @@ SRF_TEST(adversarial, limits_every_bound_is_consulted) {
         const srf::SegmentListSnapshot after = harness.store().snapshot(srf::test::list_id(1));
         const srf::SnapshotDiff diff = harness.store().diff(before, after);
         SRF_EXPECT(diff.truncated);
-        SRF_EXPECT(diff.entries.size() <= static_cast<std::size_t>(1));
+        SRF_EXPECT(!diff.complete());
+        SRF_EXPECT_EQ(diff.retained_entries(), static_cast<std::uint32_t>(1));
+        SRF_EXPECT(diff.total_entries > diff.retained_entries());
     }
     {
         srf::Limits limits{};
@@ -1280,15 +1288,23 @@ SRF_TEST(adversarial, limits_every_bound_is_consulted) {
         SRF_EXPECT_EQ(harness.store().total_segments(), static_cast<std::size_t>(2));
     }
     {
-        // Silent truncation: the attempt log is exactly the bound.
+        // The bounded replay table refuses explicitly rather than forgetting a
+        // record, so a replay can never be mistaken for a fresh mutation.
         srf::Limits limits{};
         limits.max_attempt_records = 2;
         Harness harness(true, limits);
-        for (std::uint64_t n = 1; n <= 5; ++n) {
-            SRF_EXPECT(harness.create(n, {srf::test::node_segment(n)}).ok());
-        }
+        SRF_EXPECT(harness.create(1, {srf::test::node_segment(1)}).ok());
+        SRF_EXPECT(harness.create(2, {srf::test::node_segment(2)}).ok());
+        const std::uint64_t revision = harness.store().revision();
+        const srf::MutationOutcome refused = harness.create(3, {srf::test::node_segment(3)});
+        SRF_EXPECT_EQ(static_cast<int>(refused.status),
+                      static_cast<int>(srf::StatusCode::LimitExceeded));
+        SRF_EXPECT_PRIMARY(refused.result, srf::ReasonCode::LimitMaxAttemptRecords);
         SRF_EXPECT_EQ(harness.store().export_state().attempts.size(),
                       static_cast<std::size_t>(2));
+        SRF_EXPECT_EQ(harness.store().list_count(), static_cast<std::size_t>(2));
+        SRF_EXPECT_EQ(harness.store().revision(), revision);
+        SRF_EXPECT(!harness.store().get(srf::test::list_id(3)).has_value());
     }
     {
         srf::Limits limits{};

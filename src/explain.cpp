@@ -82,8 +82,12 @@ namespace {
     return out;
 }
 
+/// Records one explanation entry. The complete total is always counted so that a
+/// bounded presentation can report how many entries it did not retain; the retained
+/// prefix is the deterministic first slice of the complete explanation.
 void push_entry(Explanation& explanation, const Limits& limits, ReasonCode code,
                 std::uint32_t index = 0, std::uint64_t detail = 0) {
+    ++explanation.total_entries;
     if (explanation.entries.size() >= limits.max_explanation_entries) {
         explanation.truncated = true;
         return;
@@ -104,8 +108,12 @@ SnapshotDiff SegmentListStore::diff(const SegmentListSnapshot& from,
         return result;
     }
     const auto limit = static_cast<std::size_t>(limits_.max_diff_entries);
+    // The complete comparison is always counted, so a bounded presentation reports
+    // how many entries it did not retain; the retained prefix is the deterministic
+    // first slice of the complete comparison.
     const auto add = [&result, limit](DiffKind kind, std::uint32_t index, std::uint32_t other,
                                       std::uint64_t detail) {
+        ++result.total_entries;
         if (result.entries.size() >= limit) {
             result.truncated = true;
             return;

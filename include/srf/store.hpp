@@ -90,6 +90,23 @@ struct MutationOutcome {
     [[nodiscard]] bool ok() const noexcept { return status == StatusCode::Ok; }
 };
 
+/// A bounded view of the durable lineage history.
+///
+/// History is a bounded audit trail, not a complete log: once at_capacity is true
+/// the oldest entries are no longer retained. Structural validity, canonical bytes,
+/// digests, lifecycle, currentness and replay are never derived from history, so
+/// bounded retention cannot change any of them.
+struct HistoryReport {
+    std::vector<DurableHistoryEntry> entries{};
+    std::uint32_t retained{0};
+    std::uint32_t limit{0};
+    /// True once the retained window has reached the configured bound, which means
+    /// older entries were dropped and this view is not a complete record.
+    bool at_capacity{false};
+
+    [[nodiscard]] bool complete() const noexcept { return !at_capacity; }
+};
+
 struct CurrentnessChange {
     SegmentListId list{};
     SegmentListGeneration generation{};
@@ -179,6 +196,9 @@ public:
     [[nodiscard]] ValidationResult persist_now();
 
     [[nodiscard]] std::vector<DurableHistoryEntry> history() const;
+    /// The same entries plus the retained/limit/at_capacity indicator that makes
+    /// bounded retention explicit to the caller.
+    [[nodiscard]] HistoryReport history_report() const;
     [[nodiscard]] DurableState export_state() const;
     [[nodiscard]] std::uint64_t revision() const;
 
@@ -218,6 +238,11 @@ private:
     void append_history_locked(DurableState& state, const SegmentList& list);
     [[nodiscard]] const DurableAttemptRecord* find_attempt_locked(const DurableState& state,
                                                                   MutationAttemptId attempt) const;
+    /// A mutation attempt is acceptable when it is already recorded, or when the
+    /// bounded replay table still has room. The table is never silently evicted:
+    /// forgetting a record would let a replay be treated as a fresh mutation and
+    /// would let a reused attempt identifier escape detection.
+    [[nodiscard]] bool attempt_table_accepts_locked(MutationAttemptId attempt) const noexcept;
 
     Limits limits_{};
     std::shared_ptr<IEvidenceSource> evidence_{};

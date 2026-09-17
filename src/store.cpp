@@ -430,10 +430,22 @@ void SegmentListStore::record_attempt_locked(DurableState& state, const CallerId
             return;
         }
     }
-    if (state.attempts.size() >= limits_.max_attempt_records) {
-        state.attempts.erase(state.attempts.begin());
-    }
+    // Capacity is checked before the mutation via attempt_table_accepts_locked();
+    // the table is never silently evicted, because forgetting a record would turn a
+    // replay into a fresh mutation and would hide a reused attempt identifier.
     state.attempts.push_back(DurableAttemptRecord{caller.attempt, list, payload, generation, true});
+}
+
+bool SegmentListStore::attempt_table_accepts_locked(MutationAttemptId attempt) const noexcept {
+    if (!attempt.valid()) {
+        return true;
+    }
+    for (const DurableAttemptRecord& record : state_.attempts) {
+        if (record.attempt == attempt) {
+            return true;
+        }
+    }
+    return state_.attempts.size() < static_cast<std::size_t>(limits_.max_attempt_records);
 }
 
 const DurableAttemptRecord* SegmentListStore::find_attempt_locked(const DurableState& state,
@@ -451,6 +463,9 @@ void SegmentListStore::append_history_locked(DurableState& state, const SegmentL
     if (!id.valid()) {
         return;
     }
+    // Bounded retention, not silent semantic truncation: history is a derived audit
+    // trail that never feeds validity, digests, lifecycle, currentness or replay, and
+    // HistoryReport::at_capacity tells the caller that older entries were dropped.
     if (state.history.size() >= limits_.max_history) {
         state.history.erase(state.history.begin());
     }
@@ -562,6 +577,15 @@ MutationOutcome SegmentListStore::run_batch(const CallerIdentity& caller,
                                    caller.attempt.value());
                 return outcome;
             }
+        }
+        if (!attempt_table_accepts_locked(caller.attempt)) {
+            // Explicit rejection rather than silent eviction: accepting this mutation
+            // would require forgetting a recorded attempt, which would break exact
+            // replay and hide reused attempt identifiers.
+            outcome.status = StatusCode::LimitExceeded;
+            outcome.result.add(ReasonCode::LimitMaxAttemptRecords, 0,
+                               limits_.max_attempt_records);
+            return outcome;
         }
         ctx.authority = authority_view();
         ctx.epoch = ctx.authority.epoch;
@@ -855,6 +879,12 @@ MutationOutcome SegmentListStore::transition(const CallerIdentity& caller, Segme
     Resolved res{};
     {
         std::unique_lock<std::mutex> lock(mutex_);
+        if (!attempt_table_accepts_locked(caller.attempt)) {
+            outcome.status = StatusCode::LimitExceeded;
+            outcome.result.add(ReasonCode::LimitMaxAttemptRecords, 0,
+                               limits_.max_attempt_records);
+            return outcome;
+        }
         ctx.authority = authority_view();
         ctx.epoch = ctx.authority.epoch;
         ctx.registry_revision = registry_.revision();
@@ -1270,6 +1300,16 @@ ValidationResult SegmentListStore::persist_now() {
 std::vector<DurableHistoryEntry> SegmentListStore::history() const {
     std::unique_lock<std::mutex> lock(mutex_);
     return state_.history;
+}
+
+HistoryReport SegmentListStore::history_report() const {
+    std::unique_lock<std::mutex> lock(mutex_);
+    HistoryReport report{};
+    report.entries = state_.history;
+    report.retained = static_cast<std::uint32_t>(state_.history.size());
+    report.limit = limits_.max_history;
+    report.at_capacity = state_.history.size() >= static_cast<std::size_t>(limits_.max_history);
+    return report;
 }
 
 DurableState SegmentListStore::export_state() const {

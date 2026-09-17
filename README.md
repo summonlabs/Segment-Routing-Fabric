@@ -1,4 +1,4 @@
-# Segment Routing Fabric 1.0.0
+# Segment Routing Fabric 1.0.1
 
 **Summon Software Labs — Distributed Fabric Infrastructure / Fabric OS**
 
@@ -273,6 +273,13 @@ scope, expected generation and `MutationAttemptId`. The default is deny.
 * Exact replay of an unchanged mutation is **idempotent** — nothing advances, nothing is written.
 * Reuse of the same attempt id with different content is rejected
   (`CommitReplayPayloadMismatch`).
+* The replay table is bounded by `Limits::max_attempt_records` and is **never
+  silently evicted**. When it is full a mutation with a new attempt identifier is refused
+  with `LimitMaxAttemptRecords` and `StatusCode::LimitExceeded`, with nothing
+  mutated, persisted or acknowledged. Forgetting a record would let an exact replay be
+  treated as a fresh mutation and would hide a reused attempt identifier, so capacity
+  exhaustion is an explicit rejection instead. Size the bound for the deployment's
+  mutation volume; recorded attempts keep replaying idempotently even at capacity.
 * A fresh process requires a fresh `WorkerBootId`; a fenced boot stays fenced permanently
   and can never be registered again (`BootAlreadyFenced`).
 * Ending a writer's connection — including a real process kill — permanently fences its boot
@@ -318,6 +325,22 @@ it: `max_lists`, `max_segments_per_list`, `max_segment_payload_bytes`,
 `max_total_segments`, `max_attempt_records`, `max_evidence_records`.
 There are no dead limits.
 
+Twelve bounds refuse explicitly with a `LimitMax*` reason in the
+`ResourceLimits` validation phase. Four are deliberately different in kind:
+
+| bound | kind | enforcement |
+|---|---|---|
+| `max_attempt_records` | authoritative input | **explicit rejection** (`LimitMaxAttemptRecords`); the replay table is never evicted |
+| `max_history` | stored-state retention | bounded retention; `HistoryReport::at_capacity` states that older entries were dropped |
+| `max_explanation_entries` | output presentation | bounded presentation; `Explanation::truncated` plus `total_entries` vs `retained_entries()` |
+| `max_diff_entries` | output presentation | bounded presentation; `SnapshotDiff::truncated` plus `total_entries` vs `retained_entries()` |
+
+A bounded presentation always reports both what it retained and what it dropped, and
+`complete()` is true only when nothing was dropped. The retained prefix is always the
+deterministic first slice of the complete result. No bounded presentation can change a
+digest, a lifecycle state, currentness, the durable image or any authoritative value:
+they are computed from the complete underlying semantics and are rendered afterwards.
+
 ---
 
 ## 15. Snapshots, diffs and explanations
@@ -335,6 +358,12 @@ A pure reordering is reported as `Reorder`, not as a set of replacements.
 Explanations answer: why a list is `ACTIVE`; why it is not; why segment N is invalid;
 which capability is missing; which topology generation is stale; why a list was superseded;
 and why revalidation is required.
+
+Explanations and diffs are presentations, and a bounded one is never presented as
+complete: each carries `total_entries` (the complete count), `retained_entries()`
+(the deterministic prefix that was kept), `truncated` and `complete()`. The same
+indicator is carried on the wire, so a remote caller can distinguish a complete answer
+from a bounded one.
 
 ---
 
@@ -404,21 +433,24 @@ reorders it and observes a changed digest, and revalidates.
 * Revalidation rebinds dependency generations; a changed adjacency generation requires an
   explicit replacement.
 * The digest is a non-cryptographic integrity and identity digest.
-* The standalone oracle in @BT@oracle/@BT@ is an evidence-free cross-check of the
+* The standalone oracle in `oracle/` is an evidence-free cross-check of the
   segment-sequence path. Production and the oracle agree exactly on validity, primary
   reason, the complete reason set, canonical bytes and digest across a 420-scenario
   randomized corpus. A small number of deliberate interpretation differences remain and
   are pinned as deterministic tests that assert both sides: the oracle does not check the
-  profile generation; it reports @BT@ProfileIdInvalid@BT@ for a zero-width profile where
-  production reports @BT@ProfilePayloadWidthExceeded@BT@; production adds
-  @BT@ListEmptyNotPermitted@BT@ for an empty sequence and @BT@SegmentBindingIncomplete@BT@
-  alongside @BT@SegmentMissingBinding@BT@ for all-zero references; production scans every
+  profile generation; it reports `ProfileIdInvalid` for a zero-width profile where
+  production reports `ProfilePayloadWidthExceeded`; production adds
+  `ListEmptyNotPermitted` for an empty sequence and `SegmentBindingIncomplete`
+  alongside `SegmentMissingBinding` for all-zero references; production scans every
   segment for topology evidence while the oracle scans the bounded prefix; and the oracle
   reports equal pairs that a permitting profile allows.
-* Four bounds (@BT@max_history@BT@, @BT@max_explanation_entries@BT@, @BT@max_diff_entries@BT@,
-  @BT@max_attempt_records@BT@) are enforced by bounded truncation rather than by a
-  @BT@LimitMax*@BT@ rejection; the adversarial suite pins the exact retained size and the
-  truncation flag for those four and the exact rejection code for the other twelve.
+* Three bounds are bounded retention or bounded presentation rather than rejections:
+  `max_history` (retention, reported by `HistoryReport::at_capacity`),
+  `max_explanation_entries` and `max_diff_entries` (presentation, reported by
+  `truncated` plus `total_entries` and `retained_entries()`). None of them is reachable
+  from authoritative input semantics, and none of them can change a digest, a lifecycle
+  state, currentness or the durable image. Every other bound, including
+  `max_attempt_records`, refuses explicitly with a `LimitMax*` reason.
 
 ---
 

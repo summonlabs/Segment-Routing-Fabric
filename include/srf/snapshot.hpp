@@ -55,11 +55,21 @@ struct SnapshotDiff {
     SnapshotId to{};
     SegmentListId list{};
     std::vector<DiffEntry> entries{};
+    /// Number of entries the complete comparison contains, whether or not they were
+    /// retained. A bounded presentation has total_entries > entries.size().
+    std::uint32_t total_entries{0};
     bool truncated{false};
     bool order_changed{false};
 
     [[nodiscard]] bool empty() const noexcept { return entries.empty(); }
     [[nodiscard]] bool contains(DiffKind kind) const noexcept;
+    [[nodiscard]] std::uint32_t retained_entries() const noexcept {
+        return static_cast<std::uint32_t>(entries.size());
+    }
+    /// True when nothing was dropped. A bounded presentation is never reported as
+    /// complete, and the retained prefix is always the deterministic first slice of
+    /// the complete comparison.
+    [[nodiscard]] bool complete() const noexcept { return !truncated; }
 };
 
 enum class ExplanationTopic : std::uint8_t {
@@ -90,10 +100,20 @@ struct Explanation {
     LifecycleState state{LifecycleState::Invalid};
     Currentness currentness{Currentness::Unknown};
     std::vector<ExplanationEntry> entries{};
+    /// Number of entries the complete explanation contains, whether or not they were
+    /// retained. A bounded presentation has total_entries > entries.size().
+    std::uint32_t total_entries{0};
     bool truncated{false};
 
     [[nodiscard]] bool contains(ReasonCode code) const noexcept;
     [[nodiscard]] std::size_t size() const noexcept { return entries.size(); }
+    [[nodiscard]] std::uint32_t retained_entries() const noexcept {
+        return static_cast<std::uint32_t>(entries.size());
+    }
+    /// True when nothing was dropped. A bounded presentation is never reported as
+    /// complete, and the retained prefix is always the deterministic first slice of
+    /// the complete explanation.
+    [[nodiscard]] bool complete() const noexcept { return !truncated; }
 };
 
 [[nodiscard]] std::string_view diff_kind_name(DiffKind kind) noexcept;

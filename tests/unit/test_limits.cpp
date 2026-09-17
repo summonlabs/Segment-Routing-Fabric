@@ -120,7 +120,10 @@ SRF_TEST(limits, max_batch_size_is_consulted) {
     SRF_EXPECT_EQ(harness.store().list_count(), static_cast<std::size_t>(0));
 }
 
-SRF_TEST(limits, max_history_is_consulted) {
+// ---------------------------------------------------------------------------
+// Bounded durable history: retention, never semantic truncation.
+// ---------------------------------------------------------------------------
+SRF_TEST(limits, max_history_bounded_retention_is_explicit) {
     srf::Limits limits{};
     limits.max_history = 3;
     Harness harness(true, limits);
@@ -134,25 +137,186 @@ SRF_TEST(limits, max_history_is_consulted) {
         }
         generation = outcome.generation.value();
     }
-    const auto history = harness.store().history();
-    SRF_EXPECT_EQ(history.size(), static_cast<std::size_t>(3));
+    const srf::HistoryReport report = harness.store().history_report();
+    // Retained is exactly the bound; the view says so instead of pretending to be
+    // a complete record.
+    SRF_EXPECT_EQ(report.retained, static_cast<std::uint32_t>(3));
+    SRF_EXPECT_EQ(report.limit, static_cast<std::uint32_t>(3));
+    SRF_EXPECT(report.at_capacity);
+    SRF_EXPECT(!report.complete());
+    SRF_EXPECT_EQ(report.entries.size(), static_cast<std::size_t>(3));
+    SRF_EXPECT_EQ(harness.store().history().size(), static_cast<std::size_t>(3));
     bool increasing = true;
-    for (std::size_t i = 1; i < history.size(); ++i) {
-        if (!(history[i - 1].id < history[i].id)) {
+    for (std::size_t i = 1; i < report.entries.size(); ++i) {
+        if (!(report.entries[i - 1].id < report.entries[i].id)) {
             increasing = false;
         }
     }
     SRF_EXPECT(increasing);
+
+    // Bounded history never changed any authoritative value.
+    const auto list = harness.store().get(list_id(1));
+    SRF_EXPECT(list.has_value());
+    if (list.has_value()) {
+        SRF_EXPECT(list->generation.value() == generation);
+        SRF_EXPECT_EQ(static_cast<int>(list->state),
+                      static_cast<int>(srf::LifecycleState::Active));
+        SRF_EXPECT_EQ(static_cast<int>(list->currentness),
+                      static_cast<int>(srf::Currentness::Current));
+        SRF_EXPECT_EQ(list->content.segments.size(), static_cast<std::size_t>(1));
+    }
+    SRF_EXPECT_EQ(harness.store().list_count(), static_cast<std::size_t>(1));
+
+    // One below the bound, and exactly at the bound, both report a complete view.
+    srf::Limits roomy{};
+    roomy.max_history = 8;
+    Harness spacious(true, roomy);
+    SRF_EXPECT(spacious.create(1, {node_segment(1)}).ok());
+    const srf::HistoryReport small = spacious.store().history_report();
+    SRF_EXPECT_EQ(small.retained, static_cast<std::uint32_t>(1));
+    SRF_EXPECT(!small.at_capacity);
+    SRF_EXPECT(small.complete());
 }
 
-SRF_TEST(limits, max_attempt_records_is_consulted) {
+// ---------------------------------------------------------------------------
+// Bounded replay table: an explicit rejection, never a silent eviction.
+// ---------------------------------------------------------------------------
+SRF_TEST(limits, max_attempt_records_is_an_explicit_rejection) {
     srf::Limits limits{};
     limits.max_attempt_records = 2;
     Harness harness(true, limits);
-    for (std::uint64_t n = 1; n <= 5; ++n) {
-        SRF_EXPECT(harness.create(n, {node_segment(n)}).ok());
-    }
+
+    // One below the bound and exactly at the bound both accept.
+    SRF_EXPECT(harness.create(1, {node_segment(1)}).ok());
+    SRF_EXPECT_EQ(harness.store().export_state().attempts.size(), static_cast<std::size_t>(1));
+    SRF_EXPECT(harness.create(2, {node_segment(2)}).ok());
     SRF_EXPECT_EQ(harness.store().export_state().attempts.size(), static_cast<std::size_t>(2));
+
+    const std::uint64_t revision = harness.store().revision();
+    const std::size_t saves = harness.memory()->save_count();
+    const std::size_t lists = harness.store().list_count();
+
+    // One above is refused, with an explicit structured status, and nothing is
+    // mutated, persisted or acknowledged.
+    const srf::MutationOutcome over = harness.create(3, {node_segment(3)});
+    SRF_EXPECT(!over.ok());
+    SRF_EXPECT_EQ(static_cast<int>(over.status),
+                  static_cast<int>(srf::StatusCode::LimitExceeded));
+    SRF_EXPECT_PRIMARY(over.result, srf::ReasonCode::LimitMaxAttemptRecords);
+    SRF_EXPECT_EQ(over.result.primary_phase(), srf::ValidationPhase::ResourceLimits);
+    SRF_EXPECT(over.result.primary().detail == limits.max_attempt_records);
+    SRF_EXPECT_EQ(harness.store().list_count(), lists);
+    SRF_EXPECT_EQ(harness.store().revision(), revision);
+    SRF_EXPECT_EQ(harness.memory()->save_count(), saves);
+    SRF_EXPECT(!harness.store().get(list_id(3)).has_value());
+    SRF_EXPECT_EQ(harness.store().export_state().attempts.size(), static_cast<std::size_t>(2));
+}
+
+SRF_TEST(limits, a_full_replay_table_still_honours_replay_and_mismatch) {
+    srf::Limits limits{};
+    limits.max_attempt_records = 1;
+    Harness harness(true, limits);
+    const srf::CallerIdentity recorded = harness.caller();
+    srf::ListDraft draft = harness.draft(1);
+    draft.segments = {node_segment(1)};
+    const srf::MutationOutcome first = harness.store().create_list(recorded, draft);
+    SRF_EXPECT_OK(first);
+
+    // The table is now full. Exact replay is still idempotent and advances nothing.
+    const std::uint64_t revision = harness.store().revision();
+    const srf::MutationOutcome replay = harness.store().create_list(recorded, draft);
+    SRF_EXPECT_OK(replay);
+    SRF_EXPECT(replay.idempotent_replay);
+    SRF_EXPECT_EQ(harness.store().revision(), revision);
+
+    // Reuse of the recorded identifier with different content is still refused.
+    srf::ListDraft different = draft;
+    different.segments = {node_segment(2)};
+    const srf::MutationOutcome mismatch = harness.store().create_list(recorded, different);
+    SRF_EXPECT_EQ(static_cast<int>(mismatch.status),
+                  static_cast<int>(srf::StatusCode::Conflict));
+    SRF_EXPECT_REASON(mismatch.result, srf::ReasonCode::CommitReplayPayloadMismatch);
+
+    // A genuinely new attempt is refused for capacity, not silently forgotten.
+    const srf::MutationOutcome overflowed =
+        harness.store().create_list(harness.caller(), draft);
+    SRF_EXPECT_REASON(overflowed.result, srf::ReasonCode::LimitMaxAttemptRecords);
+    SRF_EXPECT_EQ(harness.store().list_count(), static_cast<std::size_t>(1));
+}
+
+SRF_TEST(limits, a_full_replay_table_refuses_lifecycle_mutations_too) {
+    srf::Limits limits{};
+    limits.max_attempt_records = 1;
+    Harness harness(true, limits);
+    SRF_EXPECT(harness.create(1, {node_segment(1)}).ok());
+    const srf::MutationOutcome refused =
+        harness.store().withdraw(harness.caller(), list_id(1), srf::SegmentListGeneration{1});
+    SRF_EXPECT_EQ(static_cast<int>(refused.status),
+                  static_cast<int>(srf::StatusCode::LimitExceeded));
+    SRF_EXPECT_PRIMARY(refused.result, srf::ReasonCode::LimitMaxAttemptRecords);
+    const auto list = harness.store().get(list_id(1));
+    SRF_EXPECT(list.has_value());
+    if (list.has_value()) {
+        SRF_EXPECT_EQ(static_cast<int>(list->state),
+                      static_cast<int>(srf::LifecycleState::Active));
+    }
+}
+
+SRF_TEST(limits, over_limit_input_cannot_leave_partial_authoritative_state) {
+    // Huge input must be refused without iterating or allocating per element, and
+    // must leave no partial mutation behind.
+    srf::Limits limits{};
+    limits.max_segments_per_list = 4;
+    limits.max_total_segments = 64;
+    limits.max_lists = 8;
+    Harness harness(true, limits);
+    SRF_EXPECT(harness.create(1, {node_segment(1)}).ok());
+    const srf::Digest128 before = harness.store().get(list_id(1))->content_digest;
+    const std::uint64_t revision = harness.store().revision();
+
+    std::vector<srf::Segment> enormous;
+    enormous.reserve(4096);
+    for (std::uint64_t n = 1; n <= 5; ++n) {
+        enormous.push_back(node_segment(n));
+    }
+    // Beyond the bounded scan window every identifier is unknown to the fabric. If
+    // the structural phase scanned the whole sequence it would report them.
+    for (std::uint64_t n = 0; n < 4091; ++n) {
+        srf::Segment unknown = node_segment(1);
+        unknown.id = srf::SegmentId{0xDEAD'0000ull + n};
+        enormous.push_back(unknown);
+    }
+    const srf::MutationOutcome refused = harness.create(2, enormous);
+    SRF_EXPECT(!refused.ok());
+    SRF_EXPECT_REASON(refused.result, srf::ReasonCode::LimitMaxSegmentsPerList);
+    SRF_EXPECT(!refused.result.contains(srf::ReasonCode::SegmentEntityUnknown));
+    SRF_EXPECT(refused.result.size() <= static_cast<std::size_t>(limits.max_reasons));
+    SRF_EXPECT_EQ(harness.store().list_count(), static_cast<std::size_t>(1));
+    SRF_EXPECT_EQ(harness.store().revision(), revision);
+    SRF_EXPECT_EQ(harness.store().total_segments(), static_cast<std::size_t>(1));
+    SRF_EXPECT(harness.store().get(list_id(1))->content_digest == before);
+    SRF_EXPECT(!harness.store().get(list_id(2)).has_value());
+
+    // A huge batch is refused by size before any draft is inspected.
+    srf::Limits batch_limits{};
+    batch_limits.max_batch_size = 2;
+    Harness batched(true, batch_limits);
+    const std::uint64_t batch_revision = batched.store().revision();
+    std::vector<srf::ListDraft> many;
+    many.reserve(4096);
+    for (std::uint64_t n = 1; n <= 4096; ++n) {
+        srf::ListDraft draft = batched.draft(n);
+        draft.segments = {node_segment(1)};
+        many.push_back(draft);
+    }
+    const srf::MutationOutcome huge =
+        batched.store().batch(batched.caller(), std::span<const srf::ListDraft>(many));
+    SRF_EXPECT_EQ(static_cast<int>(huge.status),
+                  static_cast<int>(srf::StatusCode::LimitExceeded));
+    SRF_EXPECT_EQ(huge.result.size(), static_cast<std::size_t>(1));
+    SRF_EXPECT_PRIMARY(huge.result, srf::ReasonCode::LimitMaxBatchSize);
+    SRF_EXPECT_EQ(batched.store().list_count(), static_cast<std::size_t>(0));
+    SRF_EXPECT_EQ(batched.store().revision(), batch_revision);
 }
 
 SRF_TEST(limits, max_evidence_records_is_consulted) {
@@ -187,29 +351,190 @@ SRF_TEST(limits, max_reasons_is_consulted_and_reported) {
     SRF_EXPECT_REASON(result, srf::ReasonCode::LimitMaxReasons);
 }
 
-SRF_TEST(limits, max_explanation_entries_is_consulted) {
-    srf::Limits limits{};
-    limits.max_explanation_entries = 2;
-    Harness harness(true, limits);
-    SRF_EXPECT(harness.create(1, {node_segment(1)}).ok());
-    const srf::Explanation explanation = harness.store().explain_currentness(list_id(1));
-    SRF_EXPECT(explanation.truncated);
-    SRF_EXPECT(explanation.size() <= 2);
+// ---------------------------------------------------------------------------
+// Bounded presentations: retention is explicit and never claims completeness.
+// ---------------------------------------------------------------------------
+SRF_TEST(limits, max_explanation_entries_is_an_explicit_bounded_presentation) {
+    srf::Limits tight{};
+    tight.max_explanation_entries = 2;
+    Harness bounded(true, tight);
+    SRF_EXPECT(bounded.create(1, {node_segment(1)}).ok());
+    const srf::Explanation truncated = bounded.store().explain_currentness(list_id(1));
+    SRF_EXPECT(truncated.truncated);
+    SRF_EXPECT(!truncated.complete());
+    SRF_EXPECT_EQ(truncated.retained_entries(), static_cast<std::uint32_t>(2));
+    SRF_EXPECT_EQ(truncated.size(), static_cast<std::size_t>(2));
+    SRF_EXPECT(truncated.total_entries > truncated.retained_entries());
+
+    srf::Limits roomy{};
+    roomy.max_explanation_entries = 64;
+    Harness complete(true, roomy);
+    SRF_EXPECT(complete.create(1, {node_segment(1)}).ok());
+    const srf::Explanation whole = complete.store().explain_currentness(list_id(1));
+    SRF_EXPECT(!whole.truncated);
+    SRF_EXPECT(whole.complete());
+    SRF_EXPECT_EQ(whole.total_entries, whole.retained_entries());
+
+    // The complete total is the same on both tracks, and the retained prefix is the
+    // deterministic first slice of the complete explanation.
+    SRF_EXPECT_EQ(truncated.total_entries, whole.total_entries);
+    SRF_EXPECT(whole.retained_entries() > truncated.retained_entries());
+    for (std::size_t i = 0; i < truncated.entries.size(); ++i) {
+        SRF_EXPECT(truncated.entries[i] == whole.entries[i]);
+    }
+
+    // One below the bound is a complete presentation.
+    srf::Limits exactly{};
+    exactly.max_explanation_entries = static_cast<std::uint32_t>(whole.total_entries);
+    Harness exact(true, exactly);
+    SRF_EXPECT(exact.create(1, {node_segment(1)}).ok());
+    const srf::Explanation fitting = exact.store().explain_currentness(list_id(1));
+    SRF_EXPECT(!fitting.truncated);
+    SRF_EXPECT_EQ(fitting.retained_entries(), whole.total_entries);
 }
 
-SRF_TEST(limits, max_diff_entries_is_consulted) {
+SRF_TEST(limits, max_diff_entries_is_an_explicit_bounded_presentation) {
+    srf::Limits tight{};
+    tight.max_diff_entries = 1;
+    Harness bounded(true, tight);
+    SRF_EXPECT(bounded.create(1, {node_segment(1)}).ok());
+    const srf::SegmentListSnapshot before = bounded.store().snapshot(list_id(1));
+    SRF_EXPECT_OK(bounded.replace(1, {node_segment(2), node_segment(3)}, 1));
+    const srf::SegmentListSnapshot after = bounded.store().snapshot(list_id(1));
+    const srf::SnapshotDiff truncated = bounded.store().diff(before, after);
+    SRF_EXPECT(truncated.truncated);
+    SRF_EXPECT(!truncated.complete());
+    SRF_EXPECT_EQ(truncated.retained_entries(), static_cast<std::uint32_t>(1));
+    SRF_EXPECT_EQ(truncated.entries.size(), static_cast<std::size_t>(1));
+    SRF_EXPECT(truncated.total_entries > truncated.retained_entries());
+
+    srf::Limits roomy{};
+    roomy.max_diff_entries = 512;
+    Harness complete(true, roomy);
+    SRF_EXPECT(complete.create(1, {node_segment(1)}).ok());
+    const srf::SegmentListSnapshot whole_before = complete.store().snapshot(list_id(1));
+    SRF_EXPECT_OK(complete.replace(1, {node_segment(2), node_segment(3)}, 1));
+    const srf::SegmentListSnapshot whole_after = complete.store().snapshot(list_id(1));
+    const srf::SnapshotDiff whole = complete.store().diff(whole_before, whole_after);
+    SRF_EXPECT(!whole.truncated);
+    SRF_EXPECT(whole.complete());
+    SRF_EXPECT_EQ(whole.total_entries, whole.retained_entries());
+
+    SRF_EXPECT_EQ(truncated.total_entries, whole.total_entries);
+    SRF_EXPECT(whole.retained_entries() > truncated.retained_entries());
+    SRF_EXPECT(truncated.entries[0] == whole.entries[0]);
+
+    // Exactly at the bound is still complete.
+    srf::Limits exactly{};
+    exactly.max_diff_entries = whole.total_entries;
+    Harness exact(true, exactly);
+    SRF_EXPECT(exact.create(1, {node_segment(1)}).ok());
+    const srf::SegmentListSnapshot exact_before = exact.store().snapshot(list_id(1));
+    SRF_EXPECT_OK(exact.replace(1, {node_segment(2), node_segment(3)}, 1));
+    const srf::SegmentListSnapshot exact_after = exact.store().snapshot(list_id(1));
+    const srf::SnapshotDiff fitting = exact.store().diff(exact_before, exact_after);
+    SRF_EXPECT(!fitting.truncated);
+    SRF_EXPECT_EQ(fitting.retained_entries(), whole.retained_entries());
+}
+
+SRF_TEST(limits, bounded_presentation_never_changes_authoritative_state) {
+    // Rendering bounds are presentation only: the durable image, the content digest
+    // and the lifecycle state must be byte-identical either way.
+    srf::DurableState bounded_state{};
+    srf::Digest128 bounded_digest{};
+    {
+        srf::Limits tight{};
+        tight.max_explanation_entries = 1;
+        tight.max_diff_entries = 1;
+        tight.max_history = 1;
+        Harness harness(true, tight);
+        SRF_EXPECT(harness.create(1, {node_segment(1), node_segment(2)}).ok());
+        const srf::SegmentListSnapshot before = harness.store().snapshot(list_id(1));
+        SRF_EXPECT_OK(harness.replace(1, {node_segment(2), node_segment(3)}, 1));
+        const srf::SegmentListSnapshot after = harness.store().snapshot(list_id(1));
+        (void)harness.store().diff(before, after);
+        (void)harness.store().explain_currentness(list_id(1));
+        (void)harness.store().explain(list_id(1));
+        (void)harness.store().history_report();
+        bounded_digest = after.digest;
+        bounded_state = harness.store().export_state();
+    }
+    srf::DurableState complete_state{};
+    srf::Digest128 complete_digest{};
+    {
+        srf::Limits roomy{};
+        Harness harness(true, roomy);
+        SRF_EXPECT(harness.create(1, {node_segment(1), node_segment(2)}).ok());
+        const srf::SegmentListSnapshot before = harness.store().snapshot(list_id(1));
+        SRF_EXPECT_OK(harness.replace(1, {node_segment(2), node_segment(3)}, 1));
+        const srf::SegmentListSnapshot after = harness.store().snapshot(list_id(1));
+        (void)harness.store().diff(before, after);
+        (void)harness.store().explain_currentness(list_id(1));
+        (void)harness.store().explain(list_id(1));
+        (void)harness.store().history_report();
+        complete_digest = after.digest;
+        complete_state = harness.store().export_state();
+    }
+    SRF_EXPECT(bounded_digest == complete_digest);
+    SRF_EXPECT_EQ(bounded_state.lists.size(), complete_state.lists.size());
+    if (!bounded_state.lists.empty() && !complete_state.lists.empty()) {
+        SRF_EXPECT(bounded_state.lists[0].content == complete_state.lists[0].content);
+        SRF_EXPECT(bounded_state.lists[0].content_digest == complete_state.lists[0].content_digest);
+        SRF_EXPECT_EQ(static_cast<int>(bounded_state.lists[0].state),
+                      static_cast<int>(complete_state.lists[0].state));
+        SRF_EXPECT_EQ(static_cast<int>(bounded_state.lists[0].currentness),
+                      static_cast<int>(complete_state.lists[0].currentness));
+    }
+    SRF_EXPECT_EQ(bounded_state.revision, complete_state.revision);
+}
+
+SRF_TEST(limits, every_rejection_leaves_the_durable_image_untouched) {
+    // Over-limit input must not alter a digest, create ACTIVE state, bypass the
+    // duplicate or depth rules, commit partial state, or be acknowledged.
     srf::Limits limits{};
-    limits.max_diff_entries = 1;
+    limits.max_attempt_records = 1;
+    limits.max_segments_per_list = 8;
     Harness harness(true, limits);
     SRF_EXPECT(harness.create(1, {node_segment(1)}).ok());
-    const srf::SegmentListSnapshot before = harness.store().snapshot(list_id(1));
-    const srf::MutationOutcome replaced =
-        harness.replace(1, {node_segment(2), node_segment(3)}, 1);
-    SRF_EXPECT_OK(replaced);
-    const srf::SegmentListSnapshot after = harness.store().snapshot(list_id(1));
-    const srf::SnapshotDiff diff = harness.store().diff(before, after);
-    SRF_EXPECT(diff.truncated);
-    SRF_EXPECT(diff.entries.size() <= 1);
+    const srf::Digest128 digest = harness.store().get(list_id(1))->content_digest;
+    const std::vector<std::byte> image(harness.memory()->bytes().begin(),
+                                       harness.memory()->bytes().end());
+    const std::uint64_t revision = harness.store().revision();
+    const std::size_t saves = harness.memory()->save_count();
+
+    // The replay table is full, so every further mutation is refused explicitly.
+    const srf::MutationOutcome capacity = harness.create(2, {node_segment(2)});
+    SRF_EXPECT_REASON(capacity.result, srf::ReasonCode::LimitMaxAttemptRecords);
+    SRF_EXPECT_EQ(static_cast<int>(capacity.status),
+                  static_cast<int>(srf::StatusCode::LimitExceeded));
+
+    // The remaining rules are not bypassed by a full table: they are simply never
+    // reached, and no partial state exists either way.
+    srf::ListDraft duplicates = harness.draft(3);
+    duplicates.segments = {node_segment(1), node_segment(1)};
+    const srf::MutationOutcome repeated = harness.store().create_list(harness.caller(), duplicates);
+    SRF_EXPECT(!repeated.ok());
+
+    srf::ListDraft deep = harness.draft(4);
+    deep.segments.clear();
+    for (std::uint64_t n = 1; n <= 9; ++n) {
+        deep.segments.push_back(node_segment(n));
+    }
+    const srf::MutationOutcome too_deep = harness.store().create_list(harness.caller(), deep);
+    SRF_EXPECT(!too_deep.ok());
+
+    SRF_EXPECT_EQ(harness.store().list_count(), static_cast<std::size_t>(1));
+    SRF_EXPECT_EQ(harness.store().revision(), revision);
+    SRF_EXPECT_EQ(harness.memory()->save_count(), saves);
+    SRF_EXPECT_EQ(harness.store().get(list_id(1))->content_digest, digest);
+    SRF_EXPECT_EQ(static_cast<int>(harness.store().get(list_id(1))->state),
+                  static_cast<int>(srf::LifecycleState::Active));
+    const std::vector<std::byte> after(harness.memory()->bytes().begin(),
+                                       harness.memory()->bytes().end());
+    SRF_EXPECT(after == image);
+    SRF_EXPECT(!harness.store().get(list_id(2)).has_value());
+    SRF_EXPECT(!harness.store().get(list_id(3)).has_value());
+    SRF_EXPECT(!harness.store().get(list_id(4)).has_value());
 }
 
 SRF_TEST(limits, max_lists_bounds_wire_and_persistence_decoding) {
