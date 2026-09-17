@@ -1,0 +1,7 @@
+add_executable(srf_coordinator srf_coordinator.cpp)
+target_link_libraries(srf_coordinator PRIVATE SegmentRoutingFabric)
+target_compile_options(srf_coordinator PRIVATE ${SRF_FIRST_PARTY_WARNINGS})
+
+add_executable(srf_worker srf_worker.cpp)
+target_link_libraries(srf_worker PRIVATE SegmentRoutingFabric)
+target_compile_options(srf_worker PRIVATE ${SRF_FIRST_PARTY_WARNINGS})

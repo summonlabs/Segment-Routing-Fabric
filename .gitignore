@@ -1,0 +1,28 @@
+# build trees
+/build/
+/build-*/
+/out/
+CMakeCache.txt
+CMakeFiles/
+*.user
+
+# install trees
+/dist/
+/_install/
+
+# fresh-clone verification artifacts
+/_verify/
+
+# generated binaries
+*.exe
+*.dll
+*.lib
+*.pdb
+*.ilk
+*.exp
+*.obj
+
+# runtime artifacts
+*.srfstate
+*.srfport
+*.log

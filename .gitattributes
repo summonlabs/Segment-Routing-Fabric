@@ -1,0 +1,10 @@
+# Deterministic line endings for every text file in this repository.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.lib binary
+*.exe binary
+*.dll binary
+*.pdb binary
