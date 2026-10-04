@@ -1,9 +1,7 @@
 # Segment Routing Fabric 1.0.1
 
-**Summon Software Labs — Distributed Fabric Infrastructure / Fabric OS**
-
 Segment Routing Fabric is the explicit governed segment-list construction, validation,
-lifecycle and authority runtime of the Distributed Fabric Infrastructure stack. It answers
+lifecycle and authority runtime for data-center fabric infrastructure. It answers
 exactly one question, and refuses to answer any other:
 
 > Where the environment explicitly supports segment routing, what exact governed segment
