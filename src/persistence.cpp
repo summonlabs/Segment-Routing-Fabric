@@ -2,9 +2,12 @@
 // Copyright 2026 Summon Software Labs.
 #include "srf/persistence.hpp"
 
+#include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <system_error>
+#include <thread>
 #include <utility>
 
 #include "srf/canonical.hpp"
@@ -997,14 +1000,31 @@ bool FilePersistence::save(const DurableState& state, const Limits& limits,
             return false;
         }
     }
-    std::filesystem::rename(temp, path_, ec);
-    if (ec) {
-        std::error_code cleanup;
-        std::filesystem::remove(temp, cleanup);
-        out.add(ReasonCode::PersistIoError, 0, static_cast<std::uint64_t>(ec.value()));
-        return false;
+    // While a reader has the store open (an inspection, an antivirus or
+    // indexing scan) the replacing rename fails on Windows until the reader
+    // closes the file, so it is retried for a bounded time (about 2 s) instead
+    // of losing the write.
+    for (int attempt = 0;; ++attempt) {
+        std::filesystem::rename(temp, path_, ec);
+        if (!ec) {
+            return true;
+        }
+#if defined(_WIN32)
+        // ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION and ERROR_LOCK_VIOLATION.
+        const bool transient = ec.category() == std::system_category() &&
+                               (ec.value() == 5 || ec.value() == 32 || ec.value() == 33);
+#else
+        const bool transient = false;
+#endif
+        if (!transient || attempt >= 100) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
-    return true;
+    std::error_code cleanup;
+    std::filesystem::remove(temp, cleanup);
+    out.add(ReasonCode::PersistIoError, 0, static_cast<std::uint64_t>(ec.value()));
+    return false;
 }
 
 bool FilePersistence::load(LoadReport& report, const Limits& limits) {

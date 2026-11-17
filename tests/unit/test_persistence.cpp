@@ -2,8 +2,11 @@
 // Copyright 2026 Summon Software Labs.
 #include "fixtures.hpp"
 
+#include <chrono>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <thread>
 
 using srf::test::Harness;
 using srf::test::list_id;
@@ -426,4 +429,45 @@ SRF_TEST(persistence, every_single_byte_corruption_is_detected) {
         }
     }
     SRF_EXPECT_EQ(undetected, static_cast<std::size_t>(0));
+}
+
+SRF_TEST(persistence, store_replacement_waits_for_a_reader_to_close) {
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "srf_persistence_reader_test";
+    std::error_code ec;
+    std::filesystem::remove_all(directory, ec);
+    const std::filesystem::path path = directory / "state.srfstate";
+
+    Harness harness;
+    SRF_EXPECT(harness.create(1, {node_segment(1)}).ok());
+    srf::FilePersistence persistence(path);
+    srf::ValidationResult first_result;
+    const bool first_saved =
+        persistence.save(harness.store().export_state(), harness.store().limits(), first_result);
+    SRF_EXPECT(harness.create(2, {node_segment(2)}).ok());
+    const srf::DurableState second = harness.store().export_state();
+    bool second_saved = false;
+    bool reader_opened = false;
+    {
+        // Another tool reading the store (an inspection, a scan) holds it open
+        // while the store is replaced, and closes it shortly after.
+        std::ifstream reader(path, std::ios::binary);
+        reader_opened = reader.is_open();
+        std::thread writer([&persistence, &second, &harness, &second_saved] {
+            srf::ValidationResult second_result;
+            second_saved = persistence.save(second, harness.store().limits(), second_result);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        reader.close();
+        writer.join();
+    }
+    srf::LoadReport report{};
+    const bool loaded = persistence.load(report, harness.store().limits());
+    std::filesystem::remove_all(directory, ec);
+    SRF_EXPECT(first_saved);
+    SRF_EXPECT(reader_opened);
+    // The write is not lost because a reader had the file open for a moment.
+    SRF_EXPECT(second_saved);
+    SRF_EXPECT(loaded);
+    SRF_EXPECT_EQ(report.lists_recovered, static_cast<std::size_t>(2));
 }

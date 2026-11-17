@@ -13,6 +13,7 @@
 //
 // The final section proves that every bound in srf::Limits is consulted.
 #include "fixtures.hpp"
+#include "srf/coordinator.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -1315,4 +1316,20 @@ SRF_TEST(adversarial, limits_every_bound_is_consulted) {
                       static_cast<int>(srf::StatusCode::LimitExceeded));
         SRF_EXPECT_REASON(outcome.result, srf::ReasonCode::LimitMaxEvidenceRecords);
     }
+}
+
+SRF_TEST(adversarial, a_second_coordinator_cannot_take_a_listening_port) {
+    srf::CoordinatorServer first(srf::CoordinatorConfig{});
+    srf::ValidationResult first_result;
+    const bool first_started = first.start(first_result);
+    srf::CoordinatorConfig second_config;
+    second_config.port = first.port();
+    srf::CoordinatorServer second(second_config);
+    srf::ValidationResult second_result;
+    // Two coordinators must never share one listening port: the second start fails.
+    const bool second_started = first_started && second.start(second_result);
+    second.stop();
+    first.stop();
+    SRF_EXPECT(first_started);
+    SRF_EXPECT(!second_started);
 }
